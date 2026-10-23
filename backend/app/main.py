@@ -1,20 +1,30 @@
-"""Small stateless phishing URL scoring API. URLs are never logged or persisted."""
+"""PhishX API using the OpenPhish community feed for URL checks."""
 from __future__ import annotations
 
-import ipaddress
 import os
-import re
-import socket
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from urllib.parse import urlsplit
+import threading
+import time
+from urllib.error import URLError
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+FEED_URL = os.getenv(
+    "OPENPHISH_FEED_URL",
+    "https://openphish.com/feed.txt",
+)
+FEED_REFRESH_SECONDS = 12 * 60 * 60
+FEED_TIMEOUT_SECONDS = 20
 MAX_URL_LENGTH = 2048
-LOOKUP_TIMEOUT = max(0.05, min(float(os.getenv("PHISHX_LOOKUP_TIMEOUT_SECONDS", "0.35")), 2.0))
-_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="url-enrichment")
-app = FastAPI(title="PhishX API", version="1.0.0")
+
+app = FastAPI(title="PhishX API", version="1.1.0")
+
+_feed_lock = threading.Lock()
+_feed_urls: set[str] = set()
+_last_feed_refresh = 0.0
+_last_feed_error: str | None = None
 
 
 class PredictRequest(BaseModel):
@@ -25,11 +35,16 @@ class PredictRequest(BaseModel):
     @classmethod
     def validate_url(cls, value: str) -> str:
         value = value.strip()
-        if not value or any(ord(c) < 32 for c in value):
-            raise ValueError("url must be a non-empty URL without control characters")
         parts = urlsplit(value)
-        if parts.scheme not in {"http", "https"} or not parts.hostname:
+
+        if (
+            not value
+            or any(ord(char) < 32 for char in value)
+            or parts.scheme.lower() not in {"http", "https"}
+            or not parts.hostname
+        ):
             raise ValueError("url must be an absolute http or https URL")
+
         return value
 
 
@@ -38,41 +53,62 @@ class PredictResponse(BaseModel):
     confidence: float
 
 
-def _dns_resolves(host: str) -> bool:
-    socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    return True
+def normalize_url(value: str) -> str | None:
+    """Normalize feed entries and submitted URLs for comparison."""
+    try:
+        parts = urlsplit(value.strip())
+        host = (parts.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
+        if not host:
+            return None
+
+        port = parts.port
+        if port and not (
+            (parts.scheme.lower() == "http" and port == 80)
+            or (parts.scheme.lower() == "https" and port == 443)
+        ):
+            host = f"{host}:{port}"
+
+        path = parts.path or "/"
+        return urlunsplit(("", host, path, parts.query, ""))
+    except (UnicodeError, ValueError):
+        return None
 
 
-def score_url(raw: str) -> PredictResponse:
-    """Explainable starter signals; enrichment failures/timeouts never fail prediction."""
-    parts = urlsplit(raw)
-    host = (parts.hostname or "").lower().rstrip(".")
-    signals = 0
-    if parts.scheme != "https":
-        signals += 1
-    if "@" in parts.netloc:
-        signals += 2
-    try:
-        ipaddress.ip_address(host)
-        signals += 2
-    except ValueError:
-        pass
-    if host.startswith("xn--") or ".xn--" in host:
-        signals += 2
-    if len(host) > 50 or host.count("-") >= 4:
-        signals += 1
-    if len(parts.path) > 90 or len(parts.query) > 180:
-        signals += 1
-    if re.search(r"(login|verify|secure|account|update|wallet|password)", raw, re.I):
-        signals += 1
-    # DNS is advisory only: unknown hosts are not automatically labeled malicious.
-    try:
-        _pool.submit(_dns_resolves, host).result(timeout=LOOKUP_TIMEOUT)
-    except (FutureTimeout, OSError, ValueError):
-        pass
-    phishing = signals >= 3
-    confidence = min(0.99, 0.72 + 0.06 * max(0, signals - 3)) if phishing else max(0.55, 0.94 - 0.05 * signals)
-    return PredictResponse(verdict="phishing" if phishing else "safe", confidence=round(confidence, 2))
+def refresh_feed_if_needed() -> bool:
+    """Refresh the in-memory feed when due; retain an older copy on errors."""
+    global _feed_urls, _last_feed_refresh, _last_feed_error
+
+    with _feed_lock:
+        if _feed_urls and time.time() - _last_feed_refresh < FEED_REFRESH_SECONDS:
+            return True
+
+        request = Request(
+            FEED_URL,
+            headers={"User-Agent": "PhishX/1.1"},
+        )
+
+        try:
+            with urlopen(request, timeout=FEED_TIMEOUT_SECONDS) as response:
+                feed_text = response.read().decode("utf-8", errors="replace")
+
+            urls = {
+                normalized
+                for line in feed_text.splitlines()
+                if (normalized := normalize_url(line))
+            }
+
+            if not urls:
+                raise ValueError("OpenPhish feed was empty or contained no valid URLs")
+
+            _feed_urls = urls
+            _last_feed_refresh = time.time()
+            _last_feed_error = None
+            return True
+
+        except (OSError, URLError, TimeoutError, ValueError) as error:
+            _last_feed_error = f"{type(error).__name__}: {error}"
+            # Keep using the last successfully downloaded feed if available.
+            return bool(_feed_urls)
 
 
 @app.get("/health")
@@ -82,4 +118,17 @@ def health() -> dict[str, str]:
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest) -> PredictResponse:
-    return score_url(request.url)
+    feed_available = refresh_feed_if_needed()
+
+    if not feed_available:
+        return PredictResponse(verdict="unknown", confidence=0.0)
+
+    normalized = normalize_url(request.url)
+    if normalized is None:
+        return PredictResponse(verdict="unknown", confidence=0.0)
+
+    if normalized in _feed_urls:
+        return PredictResponse(verdict="phishing", confidence=1.0)
+
+    # OpenPhish feed absence does not establish that a URL is safe.
+    return PredictResponse(verdict="unknown", confidence=0.0)
