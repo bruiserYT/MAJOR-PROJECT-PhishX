@@ -17,6 +17,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import java.util.concurrent.TimeUnit
 
@@ -43,6 +44,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var riskSummary: TextView
     private lateinit var resultText: TextView
     private lateinit var checkButton: Button
+    private lateinit var openPhishResultText: TextView
+    private lateinit var feedTimestampText: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,6 +54,7 @@ class MainActivity : ComponentActivity() {
         window.navigationBarColor = backgroundColor
 
         CacheCleanupWorker.schedule(this)
+        OpenPhishWorker.schedule(this)
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -279,13 +283,71 @@ class MainActivity : ComponentActivity() {
             }
         )
 
+        // --- ML model result (existing) ---
         resultText = text(
             "Your result will appear here.",
             size = 14f,
             color = mutedColor
         )
-
         section.addView(resultText, topMargin = 12)
+
+        // --- OpenPhish feed result ---
+        section.addView(
+            text("THREAT FEED (OpenPhish)", 11f, mutedColor, bold = true),
+            topMargin = 16
+        )
+
+        openPhishResultText = text(
+            "Feed check will appear here.",
+            size = 14f,
+            color = mutedColor
+        )
+        section.addView(openPhishResultText, topMargin = 4)
+
+        feedTimestampText = text(
+            "Feed not yet loaded.",
+            size = 12f,
+            color = mutedColor
+        )
+        section.addView(feedTimestampText, topMargin = 4)
+
+        // Manual refresh button
+        val refreshButton = Button(this).apply {
+            text = "Refresh Feed"
+            textSize = 12f
+            setTextColor(limeColor)
+            background = roundedBackground(backgroundColor, limeColor, 10)
+            backgroundTintList = null
+            isAllCaps = false
+        }
+
+        section.addView(
+            refreshButton,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp(38)
+            ).apply {
+                topMargin = dp(8)
+            }
+        )
+
+        refreshButton.setOnClickListener {
+            refreshButton.isEnabled = false
+            refreshButton.text = "Refreshing…"
+            lifecycleScope.launch {
+                val ok = OpenPhishRepository.refreshFeed(this@MainActivity)
+                updateFeedTimestamp()
+                refreshButton.isEnabled = true
+                refreshButton.text = "Refresh Feed"
+                if (!ok) {
+                    feedTimestampText.text = "Feed refresh failed. Check your connection."
+                    feedTimestampText.setTextColor(dangerColor)
+                }
+            }
+        }
+
+        // Initialise timestamp label from whatever is in DB
+        lifecycleScope.launch { updateFeedTimestamp() }
 
         checkButton.setOnClickListener {
             val url = UrlExtractor.extract(input.text.toString())
@@ -298,8 +360,14 @@ class MainActivity : ComponentActivity() {
             checkButton.isEnabled = false
             checkButton.text = "CHECKING…"
             showResult("Checking link…", mutedColor)
+            showOpenPhishResult(FeedCheckResult.CHECK_UNAVAILABLE, cached = false)
 
             lifecycleScope.launch {
+                // --- Run ML check and OpenPhish check concurrently ---
+                val openPhishDeferred = async {
+                    OpenPhishRepository.check(this@MainActivity, url)
+                }
+
                 try {
                     val dao = PhishXDatabase.get(this@MainActivity).urlVerdicts()
                     val urlHash = hashUrl(url)
@@ -310,14 +378,17 @@ class MainActivity : ComponentActivity() {
 
                     val verdict: String
                     val confidence: Double
+                    val fromCache: Boolean
 
                     if (cached != null) {
                         verdict = cached.verdict
                         confidence = cached.confidence
+                        fromCache = true
                     } else {
                         val response = Api.service.predict(PredictRequest(url))
                         verdict = response.verdict
                         confidence = response.confidence
+                        fromCache = false
 
                         dao.save(
                             CachedVerdict(
@@ -345,15 +416,16 @@ class MainActivity : ComponentActivity() {
                     updateStats()
 
                     val confidencePercent = (confidence * 100).toInt()
+                    val cacheLabel = if (fromCache) " (cached)" else ""
                     val message = when {
                         verdict.equals("phishing", ignoreCase = true) ->
-                            "⚠ PHISHING RISK\nConfidence: $confidencePercent%\n\nDo not enter passwords or payment details."
+                            "⚠ PHISHING RISK$cacheLabel\nConfidence: $confidencePercent%\n\nDo not enter passwords or payment details."
 
                         verdict.equals("safe", ignoreCase = true) ->
-                            "✓ No phishing detected\nConfidence: $confidencePercent%"
+                            "✓ No phishing detected$cacheLabel\nConfidence: $confidencePercent%"
 
                         else ->
-                            "Review this link carefully\nResult: $verdict\nConfidence: $confidencePercent%"
+                            "Review this link carefully$cacheLabel\nResult: $verdict\nConfidence: $confidencePercent%"
                     }
 
                     val resultColor = if (
@@ -367,10 +439,19 @@ class MainActivity : ComponentActivity() {
                     showResult(message, resultColor)
                 } catch (e: Exception) {
                     showResult(
-                        "Couldn’t verify this link. Check that the backend is running.\n\n${e.javaClass.simpleName}: ${e.message.orEmpty()}",
+                        "Couldn't verify this link. Check that the backend is running.\n\n${e.javaClass.simpleName}: ${e.message.orEmpty()}",
                         mutedColor
                     )
                 } finally {
+                    // Display OpenPhish result regardless of ML outcome
+                    val feedResult = try {
+                        openPhishDeferred.await()
+                    } catch (_: Exception) {
+                        FeedCheckResult.CHECK_UNAVAILABLE
+                    }
+                    showOpenPhishResult(feedResult, cached = true)
+                    updateFeedTimestamp()
+
                     checkButton.isEnabled = true
                     checkButton.text = "CHECK LINK"
                 }
@@ -379,6 +460,39 @@ class MainActivity : ComponentActivity() {
 
         return section
     }
+
+    /** Updates [openPhishResultText] to reflect a [FeedCheckResult]. */
+    private fun showOpenPhishResult(result: FeedCheckResult, cached: Boolean) {
+        val cacheNote = if (cached) " (cached data)" else ""
+        val (label, color) = when (result) {
+            FeedCheckResult.PHISHING ->
+                "🛑 Known Phishing URL" to dangerColor
+
+            FeedCheckResult.NO_FEED_MATCH ->
+                "✓ No Feed Match$cacheNote" to limeColor
+
+            FeedCheckResult.CHECK_UNAVAILABLE ->
+                "⚠ Check Unavailable — feed not loaded yet" to mutedColor
+        }
+        openPhishResultText.text = label
+        openPhishResultText.setTextColor(color)
+    }
+
+    /** Reads the last-updated timestamp from DB and updates [feedTimestampText]. */
+    private suspend fun updateFeedTimestamp() {
+        val ts = OpenPhishRepository.lastUpdatedAt(this)
+        if (ts == null) {
+            feedTimestampText.text = "Feed not yet downloaded."
+            feedTimestampText.setTextColor(mutedColor)
+        } else {
+            val formatted = java.text.SimpleDateFormat(
+                "dd MMM yyyy, HH:mm", java.util.Locale.getDefault()
+            ).format(java.util.Date(ts))
+            feedTimestampText.text = "Feed last updated: $formatted"
+            feedTimestampText.setTextColor(mutedColor)
+        }
+    }
+
 
     private fun createBreakdown(): View {
         val section = LinearLayout(this).apply {

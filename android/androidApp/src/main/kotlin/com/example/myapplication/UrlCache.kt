@@ -10,6 +10,8 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
@@ -49,17 +51,43 @@ interface UrlVerdictDao {
 }
 
 @Database(
-    entities = [CachedVerdict::class],
-    version = 1,
+    entities = [
+        CachedVerdict::class,
+        OpenPhishUrl::class,
+        OpenPhishMeta::class
+    ],
+    version = 2,
     exportSchema = false
 )
 abstract class PhishXDatabase : RoomDatabase() {
 
     abstract fun urlVerdicts(): UrlVerdictDao
+    abstract fun openPhish(): OpenPhishDao
 
     companion object {
         @Volatile
         private var instance: PhishXDatabase? = null
+
+        /** Schema migration: v1 → v2 adds the two OpenPhish tables. */
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS openphish_urls (
+                        url TEXT NOT NULL PRIMARY KEY
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS openphish_meta (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        lastUpdatedAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
 
         fun get(context: Context): PhishXDatabase {
             return instance ?: synchronized(this) {
@@ -67,9 +95,11 @@ abstract class PhishXDatabase : RoomDatabase() {
                     context.applicationContext,
                     PhishXDatabase::class.java,
                     "phishx_cache.db"
-                ).build().also { database ->
-                    instance = database
-                }
+                )
+                    .addMigrations(MIGRATION_1_2)
+                    .build().also { database ->
+                        instance = database
+                    }
             }
         }
     }
