@@ -1,30 +1,44 @@
-"""PhishX API using the OpenPhish community feed for URL checks."""
+"""PhishX API using the OpenPhish community feed and intelligent multi-signal URL detector."""
 from __future__ import annotations
 
 import os
 import threading
 import time
+from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+import joblib
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.detector import classify_url
 
 FEED_URL = os.getenv(
     "OPENPHISH_FEED_URL",
     "https://openphish.com/feed.txt",
 )
 FEED_REFRESH_SECONDS = 12 * 60 * 60
-FEED_TIMEOUT_SECONDS = 20
+FEED_TIMEOUT_SECONDS = 10
 MAX_URL_LENGTH = 2048
 
-app = FastAPI(title="PhishX API", version="1.1.0")
+app = FastAPI(title="PhishX API", version="1.2.0")
+MODEL_PATH = Path(__file__).with_name("url_model.joblib")
+
+try:
+    _model_bundle = joblib.load(MODEL_PATH) if MODEL_PATH.exists() else None
+except Exception as error:
+    _model_bundle = None
+    _model_load_error = f"{type(error).__name__}: {error}"
+else:
+    _model_load_error = None
 
 _feed_lock = threading.Lock()
 _feed_urls: set[str] = set()
 _last_feed_refresh = 0.0
 _last_feed_error: str | None = None
+_is_refreshing = False
 
 
 class PredictRequest(BaseModel):
@@ -35,6 +49,8 @@ class PredictRequest(BaseModel):
     @classmethod
     def validate_url(cls, value: str) -> str:
         value = value.strip()
+        if not value.startswith(("http://", "https://")):
+            value = "https://" + value
         parts = urlsplit(value)
 
         if (
@@ -51,10 +67,11 @@ class PredictRequest(BaseModel):
 class PredictResponse(BaseModel):
     verdict: str
     confidence: float
+    reason: str | None = None
 
 
-def normalize_url(value: str) -> str | None:
-    """Normalize feed entries and submitted URLs for comparison."""
+def normalize_feed_url(value: str) -> str | None:
+    """Normalize feed entries for comparison."""
     try:
         parts = urlsplit(value.strip())
         host = (parts.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
@@ -74,61 +91,84 @@ def normalize_url(value: str) -> str | None:
         return None
 
 
-def refresh_feed_if_needed() -> bool:
-    """Refresh the in-memory feed when due; retain an older copy on errors."""
-    global _feed_urls, _last_feed_refresh, _last_feed_error
+def _do_feed_fetch() -> None:
+    global _feed_urls, _last_feed_refresh, _last_feed_error, _is_refreshing
 
-    with _feed_lock:
-        if _feed_urls and time.time() - _last_feed_refresh < FEED_REFRESH_SECONDS:
-            return True
-
+    try:
         request = Request(
             FEED_URL,
-            headers={"User-Agent": "PhishX/1.1"},
+            headers={"User-Agent": "PhishX/1.2"},
         )
+        with urlopen(request, timeout=FEED_TIMEOUT_SECONDS) as response:
+            feed_text = response.read().decode("utf-8", errors="replace")
 
-        try:
-            with urlopen(request, timeout=FEED_TIMEOUT_SECONDS) as response:
-                feed_text = response.read().decode("utf-8", errors="replace")
+        urls = {
+            normalized
+            for line in feed_text.splitlines()
+            if (normalized := normalize_feed_url(line))
+        }
 
-            urls = {
-                normalized
-                for line in feed_text.splitlines()
-                if (normalized := normalize_url(line))
-            }
-
-            if not urls:
-                raise ValueError("OpenPhish feed was empty or contained no valid URLs")
-
-            _feed_urls = urls
-            _last_feed_refresh = time.time()
-            _last_feed_error = None
-            return True
-
-        except (OSError, URLError, TimeoutError, ValueError) as error:
+        if urls:
+            with _feed_lock:
+                _feed_urls = urls
+                _last_feed_refresh = time.time()
+                _last_feed_error = None
+    except (OSError, URLError, TimeoutError, ValueError) as error:
+        with _feed_lock:
             _last_feed_error = f"{type(error).__name__}: {error}"
-            # Keep using the last successfully downloaded feed if available.
-            return bool(_feed_urls)
+            _last_feed_refresh = time.time()
+    finally:
+        with _feed_lock:
+            _is_refreshing = False
+
+
+def trigger_feed_refresh() -> None:
+    """Trigger background refresh if due, without blocking active predictions."""
+    global _is_refreshing
+
+    with _feed_lock:
+        if _is_refreshing:
+            return
+        if _feed_urls and time.time() - _last_feed_refresh < FEED_REFRESH_SECONDS:
+            return
+        _is_refreshing = True
+
+    thread = threading.Thread(target=_do_feed_fetch, daemon=True)
+    thread.start()
+
+
+@app.on_event("startup")
+def startup_event():
+    trigger_feed_refresh()
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    model_status = "loaded" if _model_bundle is not None else "unavailable"
+    with _feed_lock:
+        feed_status = f"{len(_feed_urls)} entries" if _feed_urls else "not_loaded"
+    return {
+        "status": "ok",
+        "model": model_status,
+        "feed": feed_status,
+    }
 
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest) -> PredictResponse:
-    feed_available = refresh_feed_if_needed()
+    trigger_feed_refresh()
 
-    if not feed_available:
-        return PredictResponse(verdict="unknown", confidence=0.0)
+    with _feed_lock:
+        feed_snapshot = set(_feed_urls)
 
-    normalized = normalize_url(request.url)
-    if normalized is None:
-        return PredictResponse(verdict="unknown", confidence=0.0)
+    verdict, confidence, reason = classify_url(
+        url=request.url,
+        model_bundle=_model_bundle,
+        openphish_urls=feed_snapshot,
+    )
 
-    if normalized in _feed_urls:
-        return PredictResponse(verdict="phishing", confidence=1.0)
-
-    # OpenPhish feed absence does not establish that a URL is safe.
-    return PredictResponse(verdict="unknown", confidence=0.0)
+    return PredictResponse(
+        verdict=verdict,
+        confidence=confidence,
+        reason=reason,
+    )

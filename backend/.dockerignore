@@ -1,0 +1,4 @@
+.venv/
+phishing_site_urls.csv/
+phishing_dataset.csv/
+*.csv

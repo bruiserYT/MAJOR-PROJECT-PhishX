@@ -1,15 +1,14 @@
 package com.example.myapplication
 
-import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 
 class InterceptActivity : ComponentActivity() {
@@ -21,22 +20,51 @@ class InterceptActivity : ComponentActivity() {
             return
         }
 
+        val url = uri.toString()
         val message = TextView(this).apply {
-            textSize = 20f
-            text = "Checking link…\n$uri"
+            textSize = 18f
+            setPadding(40, 60, 40, 40)
+            text = "Checking link security…\n\n$url"
         }
         setContentView(message)
 
         lifecycleScope.launch {
             try {
-                val verdict = Api.service.predict(PredictRequest(uri.toString()))
-                if (verdict.verdict.equals("phishing", ignoreCase = true)) {
-                    showWarning(uri, "⚠ This link may be phishing.")
+                // Check local OpenPhish database first (available offline)
+                val feedCheckDeferred = async {
+                    OpenPhishRepository.check(this@InterceptActivity, url)
+                }
+
+                // Call backend API classifier
+                val predictDeferred = async {
+                    try {
+                        Api.service.predict(PredictRequest(url))
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+
+                val feedResult = feedCheckDeferred.await()
+                val apiResult = predictDeferred.await()
+
+                val isPhishing = feedResult == FeedCheckResult.PHISHING ||
+                        apiResult?.verdict.equals("phishing", ignoreCase = true)
+
+                if (isPhishing) {
+                    val detail = if (feedResult == FeedCheckResult.PHISHING) {
+                        "⚠ Known Phishing URL detected in threat database."
+                    } else {
+                        "⚠ ${apiResult?.reason ?: "Suspicious phishing patterns detected."}"
+                    }
+                    showWarning(uri, detail)
+                } else if (apiResult?.verdict.equals("safe", ignoreCase = true)) {
+                    openBrowser(uri)
                 } else {
-                    openChrome(uri)
+                    // Ambiguous or offline with no feed match: prompt user
+                    showWarning(uri, "This link could not be verified with high confidence.")
                 }
             } catch (_: Exception) {
-                showWarning(uri, "Couldn't verify this link.")
+                showWarning(uri, "Couldn't verify this link security status.")
             }
         }
     }
@@ -44,24 +72,24 @@ class InterceptActivity : ComponentActivity() {
     private fun showWarning(uri: Uri, warning: String) {
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(32, 48, 32, 32)
+            setPadding(40, 60, 40, 40)
         }
         layout.addView(TextView(this).apply {
-            textSize = 20f
-            text = "$warning\n\n$uri"
+            textSize = 18f
+            text = "$warning\n\nDestination:\n$uri"
         })
         layout.addView(Button(this).apply {
-            text = "Go back"
+            text = "Go back (Safe)"
             setOnClickListener { finish() }
         })
         layout.addView(Button(this).apply {
-            text = "Proceed anyway"
-            setOnClickListener { openChrome(uri) }
+            text = "Proceed anyway (Risky)"
+            setOnClickListener { openBrowser(uri) }
         })
         setContentView(layout)
     }
 
-    private fun openChrome(uri: Uri) {
+    private fun openBrowser(uri: Uri) {
         try {
             startActivity(
                 Intent(Intent.ACTION_VIEW, uri)
@@ -69,7 +97,12 @@ class InterceptActivity : ComponentActivity() {
             )
             finish()
         } catch (_: Exception) {
-            showWarning(uri, "Chrome isn't available to open this link.")
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, uri))
+                finish()
+            } catch (_: Exception) {
+                showWarning(uri, "No web browser is installed to open this link.")
+            }
         }
     }
 }

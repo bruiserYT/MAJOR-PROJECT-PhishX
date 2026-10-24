@@ -46,6 +46,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var checkButton: Button
     private lateinit var openPhishResultText: TextView
     private lateinit var feedTimestampText: TextView
+    private lateinit var input: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -86,6 +87,16 @@ class MainActivity : ComponentActivity() {
         }
 
         setContentView(scrollView)
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra(android.content.Intent.EXTRA_TEXT)?.let { sharedText ->
+            if (::input.isInitialized) {
+                input.setText(sharedText)
+            }
+        }
     }
 
     private fun createHeader(): View {
@@ -239,7 +250,7 @@ class MainActivity : ComponentActivity() {
             text("CHECK A LINK", 12f, limeColor, bold = true)
         )
 
-        val input = EditText(this).apply {
+        input = EditText(this).apply {
             hint = "Paste a link or message"
             setHintTextColor(mutedColor)
             setTextColor(whiteColor)
@@ -378,16 +389,19 @@ class MainActivity : ComponentActivity() {
 
                     val verdict: String
                     val confidence: Double
+                    val reason: String?
                     val fromCache: Boolean
 
                     if (cached != null) {
                         verdict = cached.verdict
                         confidence = cached.confidence
+                        reason = null
                         fromCache = true
                     } else {
                         val response = Api.service.predict(PredictRequest(url))
                         verdict = response.verdict
                         confidence = response.confidence
+                        reason = response.reason
                         fromCache = false
 
                         dao.save(
@@ -417,15 +431,16 @@ class MainActivity : ComponentActivity() {
 
                     val confidencePercent = (confidence * 100).toInt()
                     val cacheLabel = if (fromCache) " (cached)" else ""
+                    val reasonLabel = if (!reason.isNullOrBlank()) "\n$reason" else ""
                     val message = when {
                         verdict.equals("phishing", ignoreCase = true) ->
-                            "⚠ PHISHING RISK$cacheLabel\nConfidence: $confidencePercent%\n\nDo not enter passwords or payment details."
+                            "⚠ PHISHING RISK$cacheLabel\nConfidence: $confidencePercent%$reasonLabel\n\nDo not enter passwords or payment details."
 
                         verdict.equals("safe", ignoreCase = true) ->
-                            "✓ No phishing detected$cacheLabel\nConfidence: $confidencePercent%"
+                            "✓ No phishing detected$cacheLabel\nConfidence: $confidencePercent%$reasonLabel"
 
                         else ->
-                            "Review this link carefully$cacheLabel\nResult: $verdict\nConfidence: $confidencePercent%"
+                            "Review this link carefully$cacheLabel\nResult: $verdict\nConfidence: $confidencePercent%$reasonLabel"
                     }
 
                     val resultColor = if (

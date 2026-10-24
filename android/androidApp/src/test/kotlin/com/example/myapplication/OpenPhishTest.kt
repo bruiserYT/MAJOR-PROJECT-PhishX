@@ -276,4 +276,16 @@ class OpenPhishTest {
         val extracted = UrlExtractor.extract("Visit https://example.com/path.")
         assertEquals("https://example.com/path", extracted)
     }
+
+    @Test
+    fun `UrlExtractor extracts standalone domain and prepends https`() {
+        val extracted = UrlExtractor.extract("Visit paypal.com today")
+        assertEquals("https://paypal.com", extracted)
+    }
+
+    @Test
+    fun `UrlExtractor extracts standalone domain with path and prepends https`() {
+        val extracted = UrlExtractor.extract("Check out google.com/search?q=test")
+        assertEquals("https://google.com/search?q=test", extracted)
+    }
 }
